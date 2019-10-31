@@ -13,38 +13,52 @@ class ConvNet(object):
         self.net = net
         self.layers = []
         self.output_shapes = []
+        self.input = None
         
     def make_input_layer(self, source_shape,
                          spatial_stride=(1, 1),
-                         spatial_size=None):        
+                         spatial_size=None,
+                         use_separate_nodes=False,
+                         index_map=None):        
         if spatial_size is None:
             spatial_size = (source_shape[2], source_shape[1])
 
         with self.net:
-            self.input = nengo.Node(None,
+            if self.input is None:
+                self.input = nengo.Node(
+                    None,
                     size_in=source_shape[0]*source_shape[1]*source_shape[2],
                     label='input')
 
             j = 0
             w = spatial_size[0]
             h = spatial_size[1]
-            items = np.arange(source_shape[1]*source_shape[2])
+            if index_map is not None:
+                items = index_map
+            else:
+                items = np.arange(source_shape[1]*source_shape[2])
+
             items.shape = source_shape[1:]
             layer = []
             while j + h <= source_shape[1]:
                 row = []
                 i = 0
                 while i + w <= source_shape[2]:
-                    sp = nengo.Node(None, size_in=w*h*source_shape[0],
+                    if use_separate_nodes:
+                        sp = nengo.Node(None, size_in=w*h*source_shape[0],
                                     label='[%d:%d,%d:%d]' % (j,j+h,i,i+w))
-                    row.append([sp])            
+                        row.append([sp])            
 
                     indices = np.array((items[j:j+h][:,i:i+w]).flat)
                     all_indices = []
                     for q in range(source_shape[0]):
                         all_indices.extend(indices+q*source_shape[1]*source_shape[2])
                     
-                    nengo.Connection(self.input[all_indices], sp)
+                    if use_separate_nodes:
+                        nengo.Connection(self.input[all_indices], sp)
+                    else:
+                        row.append([self.input[all_indices]])
+
                     i += spatial_stride[0]
                 j += spatial_stride[1]
                 layer.append(row)
@@ -54,7 +68,8 @@ class ConvNet(object):
                                        spatial_size[1]))
             
     def make_middle_layer(self, n_features, n_parallel,
-                          n_local, kernel_stride, kernel_size):
+                          n_local, kernel_stride, kernel_size, padding='valid',
+                          use_neurons=True, init=nengo.dists.Uniform(-1,1)):
         with self.net:
             prev_layer = self.layers[-1]
             prev_output_shape = self.output_shapes[-1]
@@ -63,24 +78,50 @@ class ConvNet(object):
                 row = []
                 for prev_col in prev_row:
                     col = []
+                    this_index = 0
                     
                     index = 0
                     for k in range(n_parallel):
+                        prev_index = 0
+                        if isinstance(init, nengo.dists.Distribution):
+                            this_inits = [init] * n_local
+                        else:
+                            this_inits = []
+                            prev_size = init.shape[2] // n_local
+
+                            for i in range(n_local):
+
+                                this_init = init[:,:,prev_index:prev_index+prev_size,
+                                             this_index:this_index+n_features]
+                                prev_index = (prev_index + prev_size)
+                                this_inits.append(this_init)
+                            this_index = (this_index + n_features)
+
                         conv = nengo.Convolution(n_features, prev_output_shape,
                                                  channels_last=False,
                                                  kernel_size=kernel_size,
-                                                 strides=kernel_stride)
-                        ens = nengo.Ensemble(conv.output_shape.size, dimensions=1,
+                                                 padding=padding,
+                                                 strides=kernel_stride,
+                                                 init=this_inits[0])
+                        if use_neurons:
+                            ens = nengo.Ensemble(conv.output_shape.size, dimensions=1,
+                                                 label='%s' % conv.output_shape)
+                            ens_neurons = ens.neurons
+                        else:
+                            ens = nengo.Node(None, size_in=conv.output_shape.size,
                                              label='%s' % conv.output_shape)
+                            ens_neurons = ens
                         for kk in range(n_local):
                             prev_k = prev_col[index%len(prev_col)]
                             conv = nengo.Convolution(n_features, prev_output_shape,
                                                      channels_last=False,
                                                      kernel_size=kernel_size,
-                                                     strides=kernel_stride)
-                            nengo.Connection(prev_k, ens.neurons, transform=conv)
+                                                     padding=padding,
+                                                     strides=kernel_stride,
+                                                     init=this_inits[kk])
+                            nengo.Connection(prev_k, ens_neurons, transform=conv)
                             index += 1
-                        col.append(ens.neurons)
+                        col.append(ens_neurons)
                     row.append(col)
                 layer.append(row)
             self.layers.append(layer)
@@ -94,3 +135,27 @@ class ConvNet(object):
                     for k in col:
                         nengo.Connection(k, self.output,
                                          transform=nengo_dl.dists.Glorot())
+                        
+    def make_merged_output(self, shape):
+        with self.net:
+            self.output = nengo.Node(None, size_in=shape[0]*shape[1], label='output')
+            indices = np.arange(shape[0]*shape[1]).reshape(shape)
+
+            count = np.zeros(self.output.size_out)
+
+            patch_shape = self.output_shapes[-1].shape
+            assert patch_shape[0] == 1
+            i = 0
+            j = 0
+            for row in self.layers[-1]:
+                for n in row:
+                    assert len(n) == 1
+                    n = n[0]
+                    items = indices[j:j+patch_shape[2],i:i+patch_shape[1]]
+                    nengo.Connection(n, self.output[items.flatten()])
+                    count[items.flatten()] += 1
+                    i += patch_shape[1]
+                j += patch_shape[2]
+                i = 0
+            assert count.min() == count.max() == 1
+
